@@ -1873,6 +1873,29 @@ func (a *Authorization) UsesClientCert() bool {
 	return false
 }
 
+// UsesClientCertSubjectAltNames reports whether any rule in this Authorization matches
+// on clientCert.subjectAltNames.
+//
+// SAN matching cannot be expressed safely on Envoy's unified matcher API: the uri_san
+// and dns_san matcher inputs join every SAN of that type into one comma-separated
+// string, and that encoding is ambiguous because commas are legal inside a URI. An
+// Authorization for which this returns true is therefore lowered to the legacy RBAC
+// `rules` API, which can evaluate SANs individually via the
+// envoy.rbac.principals.mtls_authenticated principal extension.
+func (a *Authorization) UsesClientCertSubjectAltNames() bool {
+	if a == nil {
+		return false
+	}
+
+	for _, rule := range a.Rules {
+		if rule != nil && rule.Principal.ClientCert != nil && rule.Principal.ClientCert.SubjectAltNames != nil {
+			return true
+		}
+	}
+
+	return false
+}
+
 // AuthorizationRule defines the schema for the authorization rule.
 //
 // +k8s:deepcopy-gen=true

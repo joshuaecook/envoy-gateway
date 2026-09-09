@@ -32,7 +32,7 @@ func init() {
 		AuthorizationClientCertTest,
 		AuthorizationClientCertDNSSANTest,
 		AuthorizationClientCertSubjectTest,
-		AuthorizationClientCertCombined,
+		AuthorizationClientCertSANForgeryTest,
 	)
 }
 
@@ -445,6 +445,81 @@ var AuthorizationClientCertCombined = suite.ConformanceTest{
 			tlsutils.MakeTLSRequestAndExpectEventuallyConsistentResponse(t, suite.RoundTripper,
 				suite.TimeoutConfig, gwAddr, serverCA, wrongSubjectClientCert, wrongSubjectClientKey,
 				"authz-client-cert-combined.example.com", expected)
+		})
+	},
+}
+
+// AuthorizationClientCertSANForgeryTest is the regression test for the SAN-forgery bypass.
+//
+// Envoy's uri_san/dns_san matcher inputs join every SAN of a type into ONE comma-separated
+// string, and that encoding is not injective: a certificate holding the single SAN
+// "decoy,allowed" produces the same input value as one holding the two SANs
+// {"decoy", "allowed"}. Commas are legal inside a URI (RFC 3986), so a peer can hold such
+// a SAN legitimately. Any matcher built over the joined string therefore authorizes the
+// forger — verified 200 against the previous comma-boundary regex implementation.
+//
+// Lowering SAN matching to the legacy RBAC envoy.rbac.principals.mtls_authenticated
+// principal evaluates SANs individually, so the forger must be denied.
+var AuthorizationClientCertSANForgeryTest = suite.ConformanceTest{
+	ShortName:   "AuthorizationClientCertSANForgery",
+	Description: "A single SAN containing a comma must not forge a SAN boundary",
+	Manifests:   []string{"testdata/authorization-client-cert-forgery.yaml"},
+	Test: func(t *testing.T, suite *suite.ConformanceTestSuite) {
+		ns := "gateway-conformance-infra"
+		host := "authz-client-cert-forgery.example.com"
+		routeNN := types.NamespacedName{Name: "authz-client-cert-forgery-route", Namespace: ns}
+		gwNN := types.NamespacedName{Name: "authz-client-cert-forgery-gateway", Namespace: ns}
+
+		gwAddr := kubernetes.GatewayAndRoutesMustBeAccepted(t, suite.Client, suite.TimeoutConfig,
+			suite.ControllerName, kubernetes.NewGatewayRef(gwNN), &gwapiv1.HTTPRoute{}, false, routeNN)
+
+		ancestorRef := gwapiv1.ParentReference{
+			Group:     gatewayapi.GroupPtr(gwapiv1.GroupName),
+			Kind:      gatewayapi.KindPtr(resource.KindGateway),
+			Namespace: gatewayapi.NamespacePtr(gwNN.Namespace),
+			Name:      gwapiv1.ObjectName(gwNN.Name),
+		}
+		SecurityPolicyMustBeAccepted(t, suite.Client,
+			types.NamespacedName{Name: "authz-client-cert-forgery-allow", Namespace: ns},
+			suite.ControllerName, ancestorRef)
+
+		_, _, serverCA, err := GetTLSSecret(suite.Client,
+			types.NamespacedName{Name: "authz-client-cert-forgery-server-cert", Namespace: ns})
+		if err != nil {
+			t.Fatalf("unexpected error fetching server cert secret: %v", err)
+		}
+
+		allowedCert, allowedKey, _, err := GetTLSSecret(suite.Client,
+			types.NamespacedName{Name: "authz-client-cert-forgery-allowed", Namespace: ns})
+		if err != nil {
+			t.Fatalf("unexpected error fetching allowed client cert secret: %v", err)
+		}
+
+		forgerCert, forgerKey, _, err := GetTLSSecret(suite.Client,
+			types.NamespacedName{Name: "authz-client-cert-forgery-forger", Namespace: ns})
+		if err != nil {
+			t.Fatalf("unexpected error fetching forger client cert secret: %v", err)
+		}
+
+		// Positive control. Without this, a blanket denial would look like a pass.
+		t.Run("allow the certificate that genuinely holds the permitted SAN", func(t *testing.T) {
+			expected := http.ExpectedResponse{
+				Request:   http.Request{Host: host, Path: "/allowed"},
+				Response:  http.Response{StatusCodes: []int{200}},
+				Namespace: ns,
+			}
+			tlsutils.MakeTLSRequestAndExpectEventuallyConsistentResponse(t, suite.RoundTripper,
+				suite.TimeoutConfig, gwAddr, serverCA, allowedCert, allowedKey, host, expected)
+		})
+
+		t.Run("deny the certificate whose single SAN embeds the permitted value after a comma", func(t *testing.T) {
+			expected := http.ExpectedResponse{
+				Request:   http.Request{Host: host, Path: "/allowed"},
+				Response:  http.Response{StatusCodes: []int{403}},
+				Namespace: ns,
+			}
+			tlsutils.MakeTLSRequestAndExpectEventuallyConsistentResponse(t, suite.RoundTripper,
+				suite.TimeoutConfig, gwAddr, serverCA, forgerCert, forgerKey, host, expected)
 		})
 	},
 }

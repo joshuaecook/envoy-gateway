@@ -3070,6 +3070,10 @@ func (t *Translator) buildAuthorization(
 	}
 	irAuth.DefaultAction = defaultAction
 
+	if err := validateAuthorizationSANLowering(authorization, defaultAction); err != nil {
+		return nil, fmt.Errorf("unable to translate authorization rule: %w", err)
+	}
+
 	for i := range authorization.Rules {
 		rule := &authorization.Rules[i]
 		irPrincipal := ir.Principal{}
@@ -3181,6 +3185,94 @@ func validateClientCertPrincipal(clientCert *egv1a1.ClientCertPrincipal) error {
 	}
 
 	return nil
+}
+
+// validateAuthorizationSANLowering rejects the Authorization shapes that cannot be
+// expressed once clientCert.subjectAltNames forces the legacy RBAC lowering.
+//
+// SAN matching is only safe on the legacy RBAC `rules` API, via the
+// envoy.rbac.principals.mtls_authenticated principal extension, because Envoy's unified
+// matcher inputs join every SAN of one type into a single comma-separated string and
+// commas are legal inside a URI, making that encoding forgeable. A single RBAC filter
+// instance honours either `rules` or `matcher` but not both, so an Authorization with any
+// SAN-matching rule is lowered to `rules` as a whole. Three things do not survive that
+// switch, and are rejected here rather than being silently dropped:
+//
+//   - `cel`: legacy RBAC has no CEL principal, so the condition would vanish and the
+//     rule would match more traffic than the user asked for.
+//   - `clientCert.subject`: legacy RBAC has no correct Subject DN principal.
+//     Principal.authenticated.principal_name is not one -- it consults the subject field
+//     only when the certificate carries no URI and no DNS SAN, so on exactly the
+//     certificates this mode is about it would match the SAN instead of the subject.
+//     A subject-only Authorization is unaffected and keeps using the matcher API.
+//   - mixed rule actions, or a defaultAction equal to the rule action: legacy `rules`
+//     carries ONE action plus an unordered policy map, so it cannot express EG's ordered
+//     first-match-wins evaluation over a mix of Allow and Deny rules.
+func validateAuthorizationSANLowering(authorization *egv1a1.Authorization, defaultAction egv1a1.AuthorizationAction) error {
+	usesSANs := false
+	for i := range authorization.Rules {
+		if clientCert := authorizationRuleClientCert(&authorization.Rules[i]); clientCert != nil && clientCert.SubjectAltNames != nil {
+			usesSANs = true
+			break
+		}
+	}
+	if !usesSANs {
+		return nil
+	}
+
+	var ruleAction *egv1a1.AuthorizationAction
+	for i := range authorization.Rules {
+		rule := &authorization.Rules[i]
+
+		if rule.CEL != nil {
+			return errors.New("authorization cannot combine principal.clientCert.subjectAltNames with cel " +
+				"in the same policy: matching subjectAltNames safely requires Envoy's legacy RBAC API, " +
+				"which has no CEL principal")
+		}
+
+		if clientCert := authorizationRuleClientCert(rule); clientCert != nil && clientCert.Subject != nil {
+			return errors.New("authorization cannot combine principal.clientCert.subject with " +
+				"principal.clientCert.subjectAltNames in the same policy: matching subjectAltNames safely " +
+				"requires Envoy's legacy RBAC API, which has no correct Subject DN principal; use a " +
+				"subject-only policy, or express the identity through subjectAltNames alone")
+		}
+
+		if ruleAction == nil {
+			action := rule.Action
+			ruleAction = &action
+			continue
+		}
+		if *ruleAction != rule.Action {
+			return errors.New("authorization rules must all use the same action when any rule matches on " +
+				"principal.clientCert.subjectAltNames: matching subjectAltNames safely requires Envoy's " +
+				"legacy RBAC API, which carries a single action and cannot express ordered " +
+				"first-match-wins evaluation over a mix of Allow and Deny rules")
+		}
+	}
+
+	if ruleAction == nil {
+		return nil
+	}
+
+	oppositeAction := egv1a1.AuthorizationActionDeny
+	if *ruleAction == egv1a1.AuthorizationActionDeny {
+		oppositeAction = egv1a1.AuthorizationActionAllow
+	}
+	if defaultAction != oppositeAction {
+		return fmt.Errorf("authorization matching on principal.clientCert.subjectAltNames requires "+
+			"defaultAction %q to complement the rule action %q: matching subjectAltNames safely requires "+
+			"Envoy's legacy RBAC API, where a request that matches no policy always takes the opposite "+
+			"action from the policies", oppositeAction, *ruleAction)
+	}
+
+	return nil
+}
+
+func authorizationRuleClientCert(rule *egv1a1.AuthorizationRule) *egv1a1.ClientCertPrincipal {
+	if rule == nil || rule.Principal == nil {
+		return nil
+	}
+	return rule.Principal.ClientCert
 }
 
 // validateStringMatchRegex validates the regex compiles when the matcher's type is

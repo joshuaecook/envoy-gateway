@@ -181,8 +181,9 @@ type Principal struct {
 	// client certificate. Without mTLS configured, no client certificate is
 	// available and this principal will never match.
 	//
-	// At least one of `subject` or `subjectAltNames` must be specified. When
-	// both are set, both must match for the principal to match.
+	// At least one of `subject` or `subjectAltNames` must be specified. `subject`
+	// and `subjectAltNames` cannot be used in the same `SecurityPolicy`: see the
+	// restrictions documented on `ClientCertPrincipal`.
 	//
 	// Supported match types: Subject DN (via `subject`), URI SANs (via
 	// `subjectAltNames.uris`), and DNS SANs (via `subjectAltNames.dnsNames`).
@@ -207,8 +208,21 @@ type Principal struct {
 // The following SAN types are not currently supported and will produce a
 // validation error if specified: `emailAddresses`, `ipAddresses`, `otherNames`.
 //
-// If both `subject` and `subjectAltNames` are specified, the certificate must
-// match `subject` AND the `subjectAltNames` group for the principal to match.
+// Matching on `subjectAltNames` requires Envoy's legacy RBAC API, because the
+// unified matcher API joins every SAN of one type into a single comma-separated
+// string and commas are legal inside a URI, which makes that encoding forgeable.
+// A `SecurityPolicy` whose `authorization` uses `subjectAltNames` in any rule is
+// therefore lowered as a whole to the legacy API, and the following are rejected
+// at admission rather than silently dropped:
+//
+//   - `subject` in any rule of that same `authorization`: legacy RBAC has no
+//     correct Subject DN principal. A `subject`-only policy is unaffected.
+//   - `cel` in any rule of that same `authorization`: legacy RBAC has no CEL
+//     principal.
+//   - rules whose `action` values differ from each other, or a `defaultAction`
+//     that is not the opposite of the rule action: legacy RBAC carries a single
+//     action and cannot express ordered first-match-wins evaluation over a mix
+//     of Allow and Deny rules.
 //
 // +kubebuilder:validation:XValidation:rule="has(self.subject) || has(self.subjectAltNames)",message="at least one of subject or subjectAltNames must be specified"
 // +kubebuilder:validation:XValidation:rule="!has(self.subjectAltNames) || !has(self.subjectAltNames.emailAddresses)",message="emailAddresses is not supported in clientCert; use uris or dnsNames"

@@ -2604,3 +2604,148 @@ func Test_securityPolicyOwnerChoose(t *testing.T) {
 		assert.Same(t, parentPolicy, owners.extAuthBackendRefs)
 	})
 }
+
+// TestBuildAuthorizationSANLowering pins the Authorization shapes that must be rejected
+// at admission once a rule matches on clientCert.subjectAltNames.
+//
+// SAN matching is only safe on Envoy's legacy RBAC API (the unified matcher API joins
+// every SAN of one type into a single comma-separated string, and commas are legal inside
+// a URI, so that encoding is forgeable). A single RBAC filter instance honours either
+// `rules` or `matcher`, so a SAN-matching Authorization is lowered to `rules` as a whole,
+// and anything the legacy API cannot express must fail loudly instead of being dropped.
+func TestBuildAuthorizationSANLowering(t *testing.T) {
+	tr := &Translator{}
+
+	uriSANRule := func(action egv1a1.AuthorizationAction, value string) egv1a1.AuthorizationRule {
+		return egv1a1.AuthorizationRule{
+			Action: action,
+			Principal: &egv1a1.Principal{
+				ClientCert: &egv1a1.ClientCertPrincipal{
+					SubjectAltNames: &egv1a1.SubjectAltNames{
+						URIs: []egv1a1.StringMatch{{Value: value}},
+					},
+				},
+			},
+		}
+	}
+
+	build := func(t *testing.T, name string, authorization *egv1a1.Authorization) (*ir.Authorization, error) {
+		t.Helper()
+		policy := sp("default", name)
+		policy.Spec.Authorization = authorization
+		return tr.buildAuthorization(policy, &securityPolicyOwners{})
+	}
+
+	t.Run("uris with implicit deny default is accepted", func(t *testing.T) {
+		irAuth, err := build(t, "san-allow", &egv1a1.Authorization{
+			Rules: []egv1a1.AuthorizationRule{uriSANRule(egv1a1.AuthorizationActionAllow, "spiffe://x/a")},
+		})
+		require.NoError(t, err)
+		require.True(t, irAuth.UsesClientCertSubjectAltNames())
+	})
+
+	t.Run("deny rules with allow default is accepted", func(t *testing.T) {
+		_, err := build(t, "san-deny", &egv1a1.Authorization{
+			DefaultAction: ptr.To(egv1a1.AuthorizationActionAllow),
+			Rules:         []egv1a1.AuthorizationRule{uriSANRule(egv1a1.AuthorizationActionDeny, "spiffe://x/a")},
+		})
+		require.NoError(t, err)
+	})
+
+	t.Run("cel in the same policy is rejected naming both fields", func(t *testing.T) {
+		celExpression := egv1a1.CELExpression("request.method == 'POST'")
+		_, err := build(t, "san-cel", &egv1a1.Authorization{
+			Rules: []egv1a1.AuthorizationRule{
+				uriSANRule(egv1a1.AuthorizationActionAllow, "spiffe://x/a"),
+				{Action: egv1a1.AuthorizationActionAllow, CEL: &celExpression},
+			},
+		})
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "cel")
+		require.Contains(t, err.Error(), "clientCert.subjectAltNames")
+	})
+
+	t.Run("subject in the same rule is rejected naming both fields", func(t *testing.T) {
+		rule := uriSANRule(egv1a1.AuthorizationActionAllow, "spiffe://x/a")
+		rule.Principal.ClientCert.Subject = &egv1a1.StringMatch{Value: "CN=client"}
+		_, err := build(t, "san-subject", &egv1a1.Authorization{
+			Rules: []egv1a1.AuthorizationRule{rule},
+		})
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "clientCert.subject")
+		require.Contains(t, err.Error(), "clientCert.subjectAltNames")
+	})
+
+	t.Run("subject in a sibling rule is rejected", func(t *testing.T) {
+		// Mode selection is per Authorization, so a subject match in any rule of a
+		// SAN-matching policy is equally inexpressible.
+		_, err := build(t, "san-sibling-subject", &egv1a1.Authorization{
+			Rules: []egv1a1.AuthorizationRule{
+				uriSANRule(egv1a1.AuthorizationActionAllow, "spiffe://x/a"),
+				{
+					Action: egv1a1.AuthorizationActionAllow,
+					Principal: &egv1a1.Principal{
+						ClientCert: &egv1a1.ClientCertPrincipal{
+							Subject: &egv1a1.StringMatch{Value: "CN=client"},
+						},
+					},
+				},
+			},
+		})
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "clientCert.subject")
+	})
+
+	t.Run("subject-only policy is unaffected", func(t *testing.T) {
+		irAuth, err := build(t, "subject-only", &egv1a1.Authorization{
+			Rules: []egv1a1.AuthorizationRule{
+				{
+					Action: egv1a1.AuthorizationActionAllow,
+					Principal: &egv1a1.Principal{
+						ClientCert: &egv1a1.ClientCertPrincipal{
+							Subject: &egv1a1.StringMatch{Value: "CN=client"},
+						},
+					},
+				},
+			},
+		})
+		require.NoError(t, err)
+		require.False(t, irAuth.UsesClientCertSubjectAltNames())
+	})
+
+	t.Run("mixed rule actions are rejected", func(t *testing.T) {
+		_, err := build(t, "san-mixed", &egv1a1.Authorization{
+			DefaultAction: ptr.To(egv1a1.AuthorizationActionDeny),
+			Rules: []egv1a1.AuthorizationRule{
+				uriSANRule(egv1a1.AuthorizationActionAllow, "spiffe://x/a"),
+				uriSANRule(egv1a1.AuthorizationActionDeny, "spiffe://x/b"),
+			},
+		})
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "same action")
+	})
+
+	t.Run("default action equal to the rule action is rejected", func(t *testing.T) {
+		_, err := build(t, "san-default-allow", &egv1a1.Authorization{
+			DefaultAction: ptr.To(egv1a1.AuthorizationActionAllow),
+			Rules:         []egv1a1.AuthorizationRule{uriSANRule(egv1a1.AuthorizationActionAllow, "spiffe://x/a")},
+		})
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "defaultAction")
+	})
+
+	t.Run("non-clientCert rules may accompany a SAN rule", func(t *testing.T) {
+		_, err := build(t, "san-plus-header", &egv1a1.Authorization{
+			Rules: []egv1a1.AuthorizationRule{
+				uriSANRule(egv1a1.AuthorizationActionAllow, "spiffe://x/a"),
+				{
+					Action: egv1a1.AuthorizationActionAllow,
+					Principal: &egv1a1.Principal{
+						Headers: []egv1a1.AuthorizationHeaderMatch{{Name: "x-user", Values: []string{"alice"}}},
+					},
+				},
+			},
+		})
+		require.NoError(t, err)
+	})
+}
